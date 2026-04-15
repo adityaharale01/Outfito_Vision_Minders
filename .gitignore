@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Env
+.env
+
+# DB
+store.db
+
+# Uploads
+uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+utkface/
+face_shape_dataset/
+uploads/
+
+*.h5
+*.keras
