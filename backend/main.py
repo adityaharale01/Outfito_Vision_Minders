@@ -6,7 +6,13 @@ import shutil
 import os
 import cv2
 import uuid
-import requests  # 🔥 NEW
+
+# ENV
+from dotenv import load_dotenv
+load_dotenv()
+
+# GROQ
+from groq import Groq
 
 # ML models
 from predict import predict_face_shape
@@ -17,12 +23,13 @@ from skin_type_predict import predict_skin_type
 from app.db import engine, Base, SessionLocal
 from app import models, crud
 
+from fastapi.responses import FileResponse
 app = FastAPI()
 
-# 🔥 DB create
+# DB create
 Base.metadata.create_all(bind=engine)
 
-# 🔥 CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,17 +38,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔥 FOLDERS
+# 🔥 BASE URL (IMPORTANT)
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
+# FOLDERS
 STATIC_FOLDER = "static"
 UPLOAD_FOLDER = "uploads"
 
 os.makedirs(STATIC_FOLDER, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# 🔥 STATIC
-app.mount("/static", StaticFiles(directory=STATIC_FOLDER), name="static")
+# STATIC
+@app.get("/static/{filename}")
+def get_static_file(filename: str):
+    file_path = os.path.join("static", filename)
+    return FileResponse(file_path)
 
-# 🔥 DB SESSION
+# DB SESSION
 def get_db():
     db = SessionLocal()
     try:
@@ -49,14 +62,67 @@ def get_db():
     finally:
         db.close()
 
+# GROQ SETUP
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ---------------- HOME ----------------
+def generate_ai(data):
+    try:
+        prompt = f"""
+        Give 3 short outfit suggestions:
+        Face Shape: {data['face_shape']}
+        Skin Tone: {data['skin_tone']}
+        Skin Type: {data['skin_type']}
+        Gender: {data['gender']}
+        Occasion: {data['occasion']}
+        Style: {data['style']}
+
+        Output only 3 bullet points.
+        """
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return fallback_suggestion(data)
+
+
+# 🔥 IMAGE FIX FUNCTION (IMPORTANT)
+def fix_images(items):
+    fixed = []
+
+    for item in items:
+        try:
+            obj = item.__dict__ if hasattr(item, "__dict__") else item
+
+            url = obj.get("image_url", "")
+
+            # extract only filename
+            filename = url.split("/")[-1]
+
+            # always rebuild correct URL
+            obj["image_url"] = f"{BASE_URL}/static/{filename}"
+
+            fixed.append(obj)
+
+        except Exception as e:
+            print("Fix image error:", e)
+            fixed.append(item)
+
+    return fixed
+
+
+# HOME
 @app.get("/")
 def home():
     return {"message": "API running 🚀"}
 
 
-# ---------------- ADD PRODUCT ----------------
+# ADD PRODUCT
 @app.post("/add-product")
 async def add_product(
     name: str = Form(...),
@@ -72,6 +138,7 @@ async def add_product(
 ):
     ext = file.filename.split(".")[-1]
     filename = f"{uuid.uuid4()}.{ext}"
+
     file_path = f"{STATIC_FOLDER}/{filename}"
 
     with open(file_path, "wb") as buffer:
@@ -86,42 +153,22 @@ async def add_product(
         "face_shape": face_shape,
         "skin_tone": skin_tone,
         "outfit_group": outfit_group,
-        "image_url": file_path
+        "image_url": f"{BASE_URL}/{file_path}"  # ✅ NEW DATA FIXED
     }
 
     return crud.create_product(db, product_data)
 
 
-# ---------------- FALLBACK AI ----------------
+# FALLBACK AI
 def fallback_suggestion(data):
-    tone = data["skin_tone"]
-    occasion = data["occasion"]
-
-    if tone == "fair":
-        base = "White Shirt + Blue Jeans"
-    elif tone == "medium":
-        base = "Black Shirt + Grey Pant"
-    else:
-        base = "Pastel Shirt + Beige Trouser"
-
-    if occasion == "party":
-        extra = "Add blazer and sneakers"
-    elif occasion == "formal":
-        extra = "Add formal shoes and watch"
-    else:
-        extra = "Keep it casual with sneakers"
-
-    return f"""
-Outfit 1: {base}
-Style Tip: {extra}
-
+    return """
+Outfit 1: White Shirt + Blue Jeans
 Outfit 2: Denim Jacket + T-Shirt + Slim Fit Jeans
-
-Outfit 3: Printed Shirt + Black Jeans + White Sneakers
+Outfit 3: Printed Shirt + Black Jeans + Sneakers
 """
 
 
-# ---------------- RECOMMEND ----------------
+# RECOMMEND
 @app.post("/recommend")
 async def recommend(
     file: UploadFile = File(...),
@@ -132,12 +179,13 @@ async def recommend(
 ):
     ext = file.filename.split(".")[-1]
     filename = f"{uuid.uuid4()}.{ext}"
+
     file_path = f"{UPLOAD_FOLDER}/{filename}"
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # 🔥 ML
+    # ML
     face_shape = predict_face_shape(file_path)
     skin_tone = predict_skin_tone(file_path)
 
@@ -153,22 +201,18 @@ async def recommend(
         "style": style
     }
 
-    # 🔥 GROQ CALL (NEW)
-    try:
-        response = requests.post(
-            "http://127.0.0.1:8001/ai-recommend",
-            json=data,
-            timeout=5
-        )
-        suggestion = response.json().get("suggestion", "")
-    except Exception as e:
-        print("Groq error:", e)
-        suggestion = fallback_suggestion(data)
+    # GROQ
+    suggestion = generate_ai(data)
 
-    # 🔥 DB fetch
+    # DB fetch
     facewash = crud.get_facewash_by_skin(db, skin_type)
     goggles = crud.get_goggles_by_face(db, face_shape)
     outfits = crud.get_outfit_by_tone(db, skin_tone)
+
+    # 🔥 FIX OLD + NEW IMAGES
+    facewash = fix_images(facewash)
+    goggles = fix_images(goggles)
+    outfits = fix_images(outfits)
 
     return {
         "analysis": data,
